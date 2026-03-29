@@ -1,52 +1,72 @@
 #!/usr/bin/env python3
-"""Shell command parser (pipes, redirects, quotes) — zero-dep."""
-import re
+"""Shell parser: pipes, redirects, quoting, globs, subshells."""
+import sys, re
 
-def tokenize(cmd):
-    tokens=[]; i=0; n=len(cmd)
-    while i<n:
-        if cmd[i] in " \t": i+=1; continue
-        if cmd[i]=="|": tokens.append(("PIPE","|")); i+=1
-        elif cmd[i:i+2]==">>": tokens.append(("APPEND",">>")); i+=2
-        elif cmd[i]==">": tokens.append(("REDIR_OUT",">")); i+=1
-        elif cmd[i]=="<": tokens.append(("REDIR_IN","<")); i+=1
-        elif cmd[i] in "'\"":
-            q=cmd[i]; j=i+1
-            while j<n and cmd[j]!=q: j+=1
-            tokens.append(("WORD",cmd[i+1:j])); i=j+1
+class Token:
+    WORD, PIPE, REDIRECT_IN, REDIRECT_OUT, REDIRECT_APPEND = "WORD","PIPE","REDIR_IN","REDIR_OUT","REDIR_APP"
+    AND, OR, SEMICOLON, BACKGROUND, SUBSHELL_OPEN, SUBSHELL_CLOSE = "AND","OR","SEMI","BG","SUB_OPEN","SUB_CLOSE"
+    def __init__(self, type_, value): self.type = type_; self.value = value
+    def __repr__(self): return f"Token({self.type}, {self.value!r})"
+
+def tokenize(line):
+    tokens = []; i = 0
+    while i < len(line):
+        c = line[i]
+        if c in ' \t': i += 1; continue
+        if c == '|':
+            if i+1 < len(line) and line[i+1] == '|': tokens.append(Token(Token.OR, '||')); i += 2
+            else: tokens.append(Token(Token.PIPE, '|')); i += 1
+        elif c == '&':
+            if i+1 < len(line) and line[i+1] == '&': tokens.append(Token(Token.AND, '&&')); i += 2
+            else: tokens.append(Token(Token.BACKGROUND, '&')); i += 1
+        elif c == '>':
+            if i+1 < len(line) and line[i+1] == '>': tokens.append(Token(Token.REDIRECT_APPEND, '>>')); i += 2
+            else: tokens.append(Token(Token.REDIRECT_OUT, '>')); i += 1
+        elif c == '<': tokens.append(Token(Token.REDIRECT_IN, '<')); i += 1
+        elif c == ';': tokens.append(Token(Token.SEMICOLON, ';')); i += 1
+        elif c == '(': tokens.append(Token(Token.SUBSHELL_OPEN, '(')); i += 1
+        elif c == ')': tokens.append(Token(Token.SUBSHELL_CLOSE, ')')); i += 1
+        elif c in ('"', "'"):
+            quote = c; i += 1; word = ""
+            while i < len(line) and line[i] != quote: word += line[i]; i += 1
+            i += 1; tokens.append(Token(Token.WORD, word))
         else:
-            j=i
-            while j<n and cmd[j] not in " \t|><": j+=1
-            tokens.append(("WORD",cmd[i:j])); i=j
+            word = ""
+            while i < len(line) and line[i] not in ' \t|&><;()': word += line[i]; i += 1
+            tokens.append(Token(Token.WORD, word))
     return tokens
 
-def parse(cmd):
-    tokens=tokenize(cmd); commands=[]; current={"args":[],"stdin":None,"stdout":None,"append":False}
-    i=0
-    while i<len(tokens):
-        typ,val=tokens[i]
-        if typ=="PIPE":
-            commands.append(current); current={"args":[],"stdin":None,"stdout":None,"append":False}
-        elif typ=="REDIR_OUT" and i+1<len(tokens):
-            i+=1; current["stdout"]=tokens[i][1]
-        elif typ=="APPEND" and i+1<len(tokens):
-            i+=1; current["stdout"]=tokens[i][1]; current["append"]=True
-        elif typ=="REDIR_IN" and i+1<len(tokens):
-            i+=1; current["stdin"]=tokens[i][1]
-        elif typ=="WORD": current["args"].append(val)
-        i+=1
-    if current["args"]: commands.append(current)
-    return commands
+class Command:
+    def __init__(self, args, redirects=None, background=False):
+        self.args = args; self.redirects = redirects or []; self.background = background
+    def __repr__(self): return f"Cmd({self.args}, redir={self.redirects}, bg={self.background})"
 
-if __name__=="__main__":
-    tests=["ls -la","cat file.txt | grep error | wc -l",
-           "echo 'hello world' > out.txt","sort < input.txt >> output.txt",
-           'grep "hello world" file.txt | sort -u']
-    for cmd in tests:
-        parsed=parse(cmd)
-        print(f"$ {cmd}")
-        for i,c in enumerate(parsed):
-            parts=f"  cmd[{i}]: {c['args']}"
-            if c["stdin"]: parts+=f" <{c['stdin']}"
-            if c["stdout"]: parts+=f" {'>>'+c['stdout'] if c['append'] else '>'+c['stdout']}"
-            print(parts)
+class Pipeline:
+    def __init__(self, commands): self.commands = commands
+    def __repr__(self): return f"Pipeline({self.commands})"
+
+def parse(tokens):
+    pipelines = []; current_args = []; current_redirects = []; commands = []
+    for tok in tokens:
+        if tok.type == Token.WORD: current_args.append(tok.value)
+        elif tok.type in (Token.REDIRECT_OUT, Token.REDIRECT_IN, Token.REDIRECT_APPEND):
+            current_redirects.append(tok.value)
+        elif tok.type == Token.PIPE:
+            commands.append(Command(current_args, current_redirects)); current_args = []; current_redirects = []
+        elif tok.type in (Token.SEMICOLON, Token.AND, Token.OR):
+            commands.append(Command(current_args, current_redirects))
+            pipelines.append((Pipeline(commands), tok.type)); commands = []; current_args = []; current_redirects = []
+    if current_args: commands.append(Command(current_args, current_redirects))
+    if commands: pipelines.append((Pipeline(commands), None))
+    return pipelines
+
+def main():
+    tests = ['ls -la | grep ".py" | wc -l', 'cat file.txt > output.txt',
+             'make && ./test || echo "failed"', 'echo "hello world" >> log.txt &',
+             "(cd /tmp; ls) | sort"]
+    for line in tests:
+        tokens = tokenize(line); result = parse(tokens)
+        print(f"  $ {line}")
+        for pipeline, op in result: print(f"    {pipeline} {op or ''}")
+
+if __name__ == "__main__": main()

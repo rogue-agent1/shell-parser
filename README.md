@@ -1,6 +1,6 @@
-# shell-parser
+# Shell Command Parser
 
-Zero-dependency Python implementation.
+Shell Command Parser — zero-dependency Python implementation.
 
 ## Usage
 
